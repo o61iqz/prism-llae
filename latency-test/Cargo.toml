@@ -1,0 +1,20 @@
+[package]
+name = "latency-test"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "latency_test"
+path = "src/main.rs"
+
+[dependencies]
+prism-llae = { path = "../prism-llae" }
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+]
