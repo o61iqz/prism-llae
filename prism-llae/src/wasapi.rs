@@ -10,7 +10,7 @@ use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioClient3,
     IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED, AUDCLNT_SHAREMODE_EXCLUSIVE,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, EDataFlow,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, DEVICE_STATE_ACTIVE, EDataFlow,
 };
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::System::Com::{
@@ -294,6 +294,7 @@ struct CaptureCtx {
     sink: CaptureSink,
     frame_bytes: usize,
     silent: Vec<u8>,
+    first_packet: bool,
 }
 // SAFETY: each context is used only by the thread it is moved into (COM MTA)
 unsafe impl Send for CaptureCtx {}
@@ -331,14 +332,16 @@ fn capture_loop(mut ctx: CaptureCtx, stop: Arc<AtomicBool>) {
                     ctx.capture
                         .GetBuffer(&mut pdata, &mut frames, &mut flags, None, None)?;
                     let nbytes = frames as usize * ctx.frame_bytes;
+                    let disc = flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 && !ctx.first_packet;
+                    ctx.first_packet = false;
                     if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || pdata.is_null() {
                         if ctx.silent.len() < nbytes {
                             ctx.silent.resize(nbytes, 0);
                         }
-                        ctx.sink.submit(&ctx.silent[..nbytes], frames as usize);
+                        ctx.sink.submit(&ctx.silent[..nbytes], frames as usize, disc);
                     } else {
                         let slice = slice::from_raw_parts(pdata, nbytes);
-                        ctx.sink.submit(slice, frames as usize);
+                        ctx.sink.submit(slice, frames as usize, disc);
                     }
                     ctx.capture.ReleaseBuffer(frames)?;
                 }
@@ -453,6 +456,7 @@ pub fn start(config: &EngineConfig, processor: Box<dyn Processor>) -> Result<Str
         client: capture.client,
         event: capture.event,
         sink,
+        first_packet: true,
     };
     let render_ctx = RenderCtx {
         render: unsafe { render.client.GetService::<IAudioRenderClient>()? },

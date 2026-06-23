@@ -97,6 +97,7 @@ impl StreamInfo {
 pub struct StreamStats {
     pub underruns: AtomicU64,
     pub overruns: AtomicU64,
+    pub glitches: AtomicU64,
     pub render_calls: AtomicU64,
     pub capture_calls: AtomicU64,
     pub capture_frames: AtomicU64,
@@ -108,6 +109,7 @@ impl StreamStats {
         StatsSnapshot {
             underruns: self.underruns.load(Ordering::Relaxed),
             overruns: self.overruns.load(Ordering::Relaxed),
+            glitches: self.glitches.load(Ordering::Relaxed),
             render_calls: self.render_calls.load(Ordering::Relaxed),
             capture_calls: self.capture_calls.load(Ordering::Relaxed),
             capture_frames: self.capture_frames.load(Ordering::Relaxed),
@@ -120,6 +122,7 @@ impl StreamStats {
 pub struct StatsSnapshot {
     pub underruns: u64,
     pub overruns: u64,
+    pub glitches: u64,
     pub render_calls: u64,
     pub capture_calls: u64,
     pub capture_frames: u64,

@@ -541,18 +541,20 @@ fn render_loop(s: PinStream, source: RenderSource, info: StreamInfo, stop: Arc<A
                 set_pin_state(s.pin, KSSTATE_RUN.0)?;
 
                 let events: Vec<HANDLE> = s.bufs.iter().map(|b| b.event).collect();
+                let mut head = 0usize;
                 while !stop.load(Ordering::Relaxed) {
                     WaitForMultipleObjects(&events, false, 100);
                     // drain every completed buffer to keep all IRPs in rotation
-                    for i in 0..s.bufs.len() {
+                    loop {
                         let mut bytes = 0u32;
-                        match GetOverlappedResult(s.pin, &*s.bufs[i].ovl, &mut bytes, false) {
+                        match GetOverlappedResult(s.pin, &*s.bufs[head].ovl, &mut bytes, false) {
                             Ok(()) => {
-                                source.fill(&mut s.bufs[i].data, s.period_frames);
-                                submit(s.pin, &mut s.bufs[i], true)?;
+                                source.fill(&mut s.bufs[head].data, s.period_frames);
+                                submit(s.pin, &mut s.bufs[head], true)?;
+                                head = (head + 1) % s.bufs.len();
                             }
-                            Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => {}
-                            Err(_) => {}
+                            Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => break,
+                            Err(_) => break,
                         }
                     }
                 }
@@ -583,23 +585,25 @@ fn capture_loop(s: PinStream, sink: CaptureSink, stop: Arc<AtomicBool>) {
                 set_pin_state(s.pin, KSSTATE_RUN.0)?;
 
                 let events: Vec<HANDLE> = s.bufs.iter().map(|b| b.event).collect();
+                let mut head = 0usize;
                 while !stop.load(Ordering::Relaxed) {
                     WaitForMultipleObjects(&events, false, 100);
                     // drain every completed read so no captured audio is dropped
-                    for i in 0..s.bufs.len() {
+                    loop {
                         let mut transferred = 0u32;
-                        match GetOverlappedResult(s.pin, &*s.bufs[i].ovl, &mut transferred, false) {
+                        match GetOverlappedResult(s.pin, &*s.bufs[head].ovl, &mut transferred, false) {
                             Ok(()) => {
                                 // captured count is in header.DataUsed, NOT the IOCTL transfer (= header size)
-                                let n = s.bufs[i].header.DataUsed as usize;
+                                let n = s.bufs[head].header.DataUsed as usize;
                                 if n >= s.frame_bytes {
                                     let frames = n / s.frame_bytes;
-                                    sink.submit(&s.bufs[i].data[..frames * s.frame_bytes], frames);
+                                    sink.submit(&s.bufs[head].data[..frames * s.frame_bytes], frames, false);
                                 }
-                                submit(s.pin, &mut s.bufs[i], false)?;
+                                submit(s.pin, &mut s.bufs[head], false)?;
+                                head = (head + 1) % s.bufs.len();
                             }
-                            Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => {}
-                            Err(_) => {}
+                            Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => break,
+                            Err(_) => break,
                         }
                     }
                 }

@@ -329,12 +329,13 @@ fn monitor(opts: Opts) -> Result<()> {
         let db = if p > 0.0 { 20.0 * p.log10() } else { -99.0 };
         let bars = ((p * 40.0) as usize).min(40);
         print!(
-            "\r[{:<40}] {:6.1} dBFS  cb:{} under:{} over:{}   ",
+            "\r[{:<40}] {:6.1} dBFS  cb:{} under:{} over:{} glitch:{}   ",
             "#".repeat(bars),
             db,
             stats.render_calls,
             stats.underruns,
-            stats.overruns
+            stats.overruns,
+            stats.glitches
         );
         let _ = std::io::stdout().flush();
     }
@@ -491,6 +492,7 @@ struct LatencyOutcome {
     delivery: f64,
     underruns: u64,
     overruns: u64,
+    glitches: u64,
     noise: f32,
     threshold: f32,
 }
@@ -528,6 +530,7 @@ fn run_latency(config: &EngineConfig, trials: usize) -> Result<LatencyOutcome> {
         delivery,
         underruns: stats.underruns,
         overruns: stats.overruns,
+        glitches: stats.glitches,
         noise: f32::from_bits(shared.noise_floor.load(Ordering::Relaxed)),
         threshold: f32::from_bits(shared.threshold.load(Ordering::Relaxed)),
     })
@@ -565,10 +568,11 @@ fn latency(opts: Opts) -> Result<()> {
         out.threshold
     );
     println!(
-        "engine activity: {:.0}% delivered, under:{} over:{}",
+        "engine activity: {:.0}% delivered, under:{} over:{} glitch:{}",
         out.delivery * 100.0,
         out.underruns,
-        out.overruns
+        out.overruns,
+        out.glitches
     );
 
     let stats_opt = hit_stats(&out.hits);
@@ -667,6 +671,7 @@ struct Record {
     delivery: f64,
     underruns: u64,
     overruns: u64,
+    glitches: u64,
     min_f: u32,
     median_f: u32,
     mean_f: f64,
@@ -742,6 +747,7 @@ fn record_job(
                 delivery: res.delivery * 100.0,
                 underruns: res.underruns,
                 overruns: res.overruns,
+                glitches: res.glitches,
                 min_f: min,
                 median_f: median,
                 mean_f: mean,
@@ -778,6 +784,7 @@ fn record_job(
                 delivery: 0.0,
                 underruns: 0,
                 overruns: 0,
+                glitches: 0,
                 min_f: 0,
                 median_f: 0,
                 mean_f: 0.0,
@@ -796,16 +803,16 @@ fn record_job(
 
 const CSV_HEADER: &str =
     "backend,mode,req_rate,req_format,req_block,status,act_rate,act_format,act_period_frames,\
-     channels,trials,hits,misses,delivery_pct,underruns,overruns,min_frames,median_frames,\
+     channels,trials,hits,misses,delivery_pct,underruns,overruns,glitches,min_frames,median_frames,\
      mean_frames,max_frames,min_ms,median_ms,mean_ms,max_ms,jitter_frames,detail";
 
 fn csv_line(r: &Record) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{}",
         r.backend, r.mode, r.req_rate, r.req_format, r.req_block, r.status, r.act_rate,
         r.act_format, r.act_block, r.channels, r.trials, r.hits, r.misses, r.delivery,
-        r.underruns, r.overruns, r.min_f, r.median_f, r.mean_f, r.max_f, r.min_ms, r.median_ms,
-        r.mean_ms, r.max_ms, r.jitter, r.detail,
+        r.underruns, r.overruns, r.glitches, r.min_f, r.median_f, r.mean_f, r.max_f, r.min_ms,
+        r.median_ms, r.mean_ms, r.max_ms, r.jitter, r.detail,
     )
 }
 

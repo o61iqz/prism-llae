@@ -18,7 +18,7 @@ pub struct CaptureSink {
 }
 
 impl CaptureSink {
-    pub fn submit(&mut self, native: &[u8], frames: usize) {
+    pub fn submit(&mut self, native: &[u8], frames: usize, discontinuity: bool) {
         let cap_ch = self.cap_fmt.channels as usize;
         debug_assert_eq!(native.len(), frames * self.cap_fmt.frame_bytes());
 
@@ -36,6 +36,9 @@ impl CaptureSink {
         let wanted = frames * self.proc_ch;
         if pushed_src < wanted {
             self.stats.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+        if discontinuity {
+            self.stats.glitches.fetch_add(1, Ordering::Relaxed);
         }
         self.stats.capture_calls.fetch_add(1, Ordering::Relaxed);
         self.stats
