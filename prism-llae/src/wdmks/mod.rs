@@ -30,7 +30,7 @@ use windows::Win32::Media::KernelStreaming::{
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
 
 use self::sys::{
@@ -437,6 +437,28 @@ struct PinStream {
 // SAFETY: a PinStream is only touched by the thread it is moved to
 unsafe impl Send for PinStream {}
 
+impl Drop for PinStream {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = set_pin_state(self.pin, KSSTATE_PAUSE.0);
+            let _ = set_pin_state(self.pin, KSSTATE_ACQUIRE.0);
+            let _ = set_pin_state(self.pin, KSSTATE_STOP.0);
+
+            let _ = CancelIoEx(self.pin, None);
+            for b in &self.bufs {
+                let mut n = 0u32;
+                let _ = GetOverlappedResult(self.pin, &*b.ovl, &mut n, true);
+            }
+
+            let _ = CloseHandle(self.pin);
+            let _ = CloseHandle(self.filter);
+            for b in &self.bufs {
+                let _ = CloseHandle(b.event);
+            }
+        }
+    }
+}
+
 fn make_pin_stream(
     filter: HANDLE,
     pin: HANDLE,
@@ -502,96 +524,94 @@ unsafe fn submit(pin: HANDLE, b: &mut KsBuf, write: bool) -> Result<()> {
     }
 }
 
-fn render_loop(mut s: PinStream, mut source: RenderSource, info: StreamInfo, stop: Arc<AtomicBool>) {
+fn render_loop(s: PinStream, source: RenderSource, info: StreamInfo, stop: Arc<AtomicBool>) {
     let _mmcss = ProAudioGuard::enter();
-    source.on_start(&info);
-    let mut run = || -> Result<()> {
-        unsafe {
-            let _ = set_pin_state(s.pin, KSSTATE_ACQUIRE.0);
-            let _ = set_pin_state(s.pin, KSSTATE_PAUSE.0);
-            // pre-roll silence (zeroed buffers) to fill the queue
-            for i in 0..s.bufs.len() {
-                submit(s.pin, &mut s.bufs[i], true)?;
-            }
-            set_pin_state(s.pin, KSSTATE_RUN.0)?;
-
-            let events: Vec<HANDLE> = s.bufs.iter().map(|b| b.event).collect();
-            while !stop.load(Ordering::Relaxed) {
-                WaitForMultipleObjects(&events, false, 100);
-                // drain every completed buffer to keep all IRPs in rotation
+    let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut s = s;
+        let mut source = source;
+        source.on_start(&info);
+        let mut run = || -> Result<()> {
+            unsafe {
+                let _ = set_pin_state(s.pin, KSSTATE_ACQUIRE.0);
+                let _ = set_pin_state(s.pin, KSSTATE_PAUSE.0);
+                // pre-roll silence (zeroed buffers) to fill the queue
                 for i in 0..s.bufs.len() {
-                    let mut bytes = 0u32;
-                    match GetOverlappedResult(s.pin, &*s.bufs[i].ovl, &mut bytes, false) {
-                        Ok(()) => {
-                            source.fill(&mut s.bufs[i].data, s.period_frames);
-                            submit(s.pin, &mut s.bufs[i], true)?;
+                    submit(s.pin, &mut s.bufs[i], true)?;
+                }
+                set_pin_state(s.pin, KSSTATE_RUN.0)?;
+
+                let events: Vec<HANDLE> = s.bufs.iter().map(|b| b.event).collect();
+                while !stop.load(Ordering::Relaxed) {
+                    WaitForMultipleObjects(&events, false, 100);
+                    // drain every completed buffer to keep all IRPs in rotation
+                    for i in 0..s.bufs.len() {
+                        let mut bytes = 0u32;
+                        match GetOverlappedResult(s.pin, &*s.bufs[i].ovl, &mut bytes, false) {
+                            Ok(()) => {
+                                source.fill(&mut s.bufs[i].data, s.period_frames);
+                                submit(s.pin, &mut s.bufs[i], true)?;
+                            }
+                            Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => {}
+                            Err(_) => {}
                         }
-                        Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => {}
-                        Err(_) => {}
                     }
                 }
             }
-            let _ = set_pin_state(s.pin, KSSTATE_STOP.0);
+            Ok(())
+        };
+        if let Err(e) = run() {
+            eprintln!("[prism-llae] ks render error: {e}");
         }
-        Ok(())
-    };
-    if let Err(e) = run() {
-        eprintln!("[prism-llae] ks render error: {e}");
-    }
-    unsafe {
-        for b in &s.bufs {
-            let _ = CloseHandle(b.event);
-        }
-        let _ = CloseHandle(s.pin);
-        let _ = CloseHandle(s.filter);
+    }));
+    if guard.is_err() {
+        eprintln!("[prism-llae] ks render thread panicked; pin released via Drop");
     }
 }
 
-fn capture_loop(mut s: PinStream, mut sink: CaptureSink, stop: Arc<AtomicBool>) {
+fn capture_loop(s: PinStream, sink: CaptureSink, stop: Arc<AtomicBool>) {
     let _mmcss = ProAudioGuard::enter();
-    let mut run = || -> Result<()> {
-        unsafe {
-            let _ = set_pin_state(s.pin, KSSTATE_ACQUIRE.0);
-            let _ = set_pin_state(s.pin, KSSTATE_PAUSE.0);
-            for i in 0..s.bufs.len() {
-                submit(s.pin, &mut s.bufs[i], false)?;
-            }
-            set_pin_state(s.pin, KSSTATE_RUN.0)?;
-
-            let events: Vec<HANDLE> = s.bufs.iter().map(|b| b.event).collect();
-            while !stop.load(Ordering::Relaxed) {
-                WaitForMultipleObjects(&events, false, 100);
-                // drain every completed read so no captured audio is dropped
+    let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut s = s;
+        let mut sink = sink;
+        let mut run = || -> Result<()> {
+            unsafe {
+                let _ = set_pin_state(s.pin, KSSTATE_ACQUIRE.0);
+                let _ = set_pin_state(s.pin, KSSTATE_PAUSE.0);
                 for i in 0..s.bufs.len() {
-                    let mut transferred = 0u32;
-                    match GetOverlappedResult(s.pin, &*s.bufs[i].ovl, &mut transferred, false) {
-                        Ok(()) => {
-                            // captured count is in header.DataUsed, NOT the IOCTL transfer (= header size)
-                            let n = s.bufs[i].header.DataUsed as usize;
-                            if n >= s.frame_bytes {
-                                let frames = n / s.frame_bytes;
-                                sink.submit(&s.bufs[i].data[..frames * s.frame_bytes], frames);
+                    submit(s.pin, &mut s.bufs[i], false)?;
+                }
+                set_pin_state(s.pin, KSSTATE_RUN.0)?;
+
+                let events: Vec<HANDLE> = s.bufs.iter().map(|b| b.event).collect();
+                while !stop.load(Ordering::Relaxed) {
+                    WaitForMultipleObjects(&events, false, 100);
+                    // drain every completed read so no captured audio is dropped
+                    for i in 0..s.bufs.len() {
+                        let mut transferred = 0u32;
+                        match GetOverlappedResult(s.pin, &*s.bufs[i].ovl, &mut transferred, false) {
+                            Ok(()) => {
+                                // captured count is in header.DataUsed, NOT the IOCTL transfer (= header size)
+                                let n = s.bufs[i].header.DataUsed as usize;
+                                if n >= s.frame_bytes {
+                                    let frames = n / s.frame_bytes;
+                                    sink.submit(&s.bufs[i].data[..frames * s.frame_bytes], frames);
+                                }
+                                submit(s.pin, &mut s.bufs[i], false)?;
                             }
-                            submit(s.pin, &mut s.bufs[i], false)?;
+                            Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => {}
+                            Err(_) => {}
                         }
-                        Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => {}
-                        Err(_) => {}
                     }
                 }
             }
-            let _ = set_pin_state(s.pin, KSSTATE_STOP.0);
+            Ok(())
+        };
+        if let Err(e) = run() {
+            eprintln!("[prism-llae] ks capture error: {e}");
         }
-        Ok(())
-    };
-    if let Err(e) = run() {
-        eprintln!("[prism-llae] ks capture error: {e}");
-    }
-    unsafe {
-        for b in &s.bufs {
-            let _ = CloseHandle(b.event);
-        }
-        let _ = CloseHandle(s.pin);
-        let _ = CloseHandle(s.filter);
+    }));
+    if guard.is_err() {
+        eprintln!("[prism-llae] ks capture thread panicked; pin released via Drop");
     }
 }
 
