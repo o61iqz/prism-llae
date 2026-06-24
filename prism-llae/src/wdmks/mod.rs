@@ -6,6 +6,7 @@ mod sys;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -25,7 +26,8 @@ use windows::Win32::Media::KernelStreaming::{
     KSPROPERTY_CONNECTION_STATE, KSPROPERTY_PIN_COMMUNICATION, KSPROPERTY_PIN_CTYPES,
     KSPROPERTY_PIN_DATAFLOW, KSPROPERTY_PIN_DATARANGES, KSPROPSETID_Connection, KSPROPSETID_Pin,
     KSDATAFORMAT_SPECIFIER_WAVEFORMATEX, KSSTATE_ACQUIRE, KSSTATE_PAUSE, KSSTATE_RUN, KSSTATE_STOP,
-    KSSTREAM_HEADER,
+    KSSTREAM_HEADER, KSSTREAM_HEADER_OPTIONSF_DATADISCONTINUITY,
+    KSSTREAM_HEADER_OPTIONSF_TIMEDISCONTINUITY, KSSTREAM_HEADER_OPTIONSF_TIMEVALID,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -432,6 +434,7 @@ struct PinStream {
     bufs: Vec<KsBuf>,
     frame_bytes: usize,
     period_frames: usize,
+    sample_rate: u32,
 }
 
 // SAFETY: a PinStream is only touched by the thread it is moved to
@@ -491,6 +494,7 @@ fn make_pin_stream(
         bufs,
         frame_bytes,
         period_frames,
+        sample_rate: format.sample_rate,
     })
 }
 
@@ -570,6 +574,76 @@ fn render_loop(s: PinStream, source: RenderSource, info: StreamInfo, stop: Arc<A
     }
 }
 
+const HNS_PER_SEC: i64 = 10_000_000;
+
+// KS has no discontinuity flag like WASAPI's, so infer one
+enum GlitchMode {
+    Timestamp { next_expected_pts: i64 },
+    WallClock { start: Instant, frames_total: u64 },
+}
+
+struct GlitchDetector {
+    rate: i64,
+    period_frames: usize,
+    mode: Option<GlitchMode>,
+}
+
+impl GlitchDetector {
+    fn new(sample_rate: u32, period_frames: usize) -> Self {
+        GlitchDetector {
+            rate: sample_rate.max(1) as i64,
+            period_frames,
+            mode: None,
+        }
+    }
+
+    fn observe(&mut self, header: &KSSTREAM_HEADER, frames: usize) -> bool {
+        let hinted = header.OptionsFlags
+            & (KSSTREAM_HEADER_OPTIONSF_DATADISCONTINUITY
+                | KSSTREAM_HEADER_OPTIONSF_TIMEDISCONTINUITY)
+            != 0;
+        let dur = frames as i64 * HNS_PER_SEC / self.rate;
+
+        match &mut self.mode {
+            None => {
+                if header.OptionsFlags & KSSTREAM_HEADER_OPTIONSF_TIMEVALID != 0 {
+                    let pts = header.PresentationTime.Time;
+                    self.mode = Some(GlitchMode::Timestamp {
+                        next_expected_pts: pts + dur,
+                    });
+                } else {
+                    self.mode = Some(GlitchMode::WallClock {
+                        start: Instant::now(),
+                        frames_total: 0,
+                    });
+                }
+                false
+            }
+            Some(GlitchMode::Timestamp { next_expected_pts }) => {
+                let pts = header.PresentationTime.Time;
+                let tol = (self.period_frames as i64).max(1) * HNS_PER_SEC / self.rate / 2;
+                let gap = pts - *next_expected_pts > tol;
+                *next_expected_pts = pts + dur;
+                gap || hinted
+            }
+            Some(GlitchMode::WallClock { start, frames_total }) => {
+                *frames_total += frames as u64;
+                let rate = self.rate as f64;
+                let expected = *frames_total as f64 / rate;
+                let actual = start.elapsed().as_secs_f64();
+                let one_period = self.period_frames as f64 / rate;
+                if actual - expected > N_BUFFERS as f64 * one_period {
+                    *start = Instant::now();
+                    *frames_total = 0;
+                    true
+                } else {
+                    hinted
+                }
+            }
+        }
+    }
+}
+
 fn capture_loop(s: PinStream, sink: CaptureSink, stop: Arc<AtomicBool>) {
     let _mmcss = ProAudioGuard::enter();
     let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -586,6 +660,7 @@ fn capture_loop(s: PinStream, sink: CaptureSink, stop: Arc<AtomicBool>) {
 
                 let events: Vec<HANDLE> = s.bufs.iter().map(|b| b.event).collect();
                 let mut head = 0usize;
+                let mut detector = GlitchDetector::new(s.sample_rate, s.period_frames);
                 while !stop.load(Ordering::Relaxed) {
                     WaitForMultipleObjects(&events, false, 100);
                     // drain every completed read so no captured audio is dropped
@@ -597,7 +672,8 @@ fn capture_loop(s: PinStream, sink: CaptureSink, stop: Arc<AtomicBool>) {
                                 let n = s.bufs[head].header.DataUsed as usize;
                                 if n >= s.frame_bytes {
                                     let frames = n / s.frame_bytes;
-                                    sink.submit(&s.bufs[head].data[..frames * s.frame_bytes], frames, false);
+                                    let disc = detector.observe(&s.bufs[head].header, frames);
+                                    sink.submit(&s.bufs[head].data[..frames * s.frame_bytes], frames, disc);
                                 }
                                 submit(s.pin, &mut s.bufs[head], false)?;
                                 head = (head + 1) % s.bufs.len();
