@@ -49,6 +49,7 @@ pub struct EngineConfig {
     pub input_channel: u16,  // ASIO only
     pub output_channel: u16, // ASIO only
     pub force_format: Option<SampleFormat>, // WASAPI exclusive + KS only
+    pub output_only: bool,
 }
 
 impl Default for EngineConfig {
@@ -64,6 +65,7 @@ impl Default for EngineConfig {
             input_channel: 0,
             output_channel: 0,
             force_format: None,
+            output_only: false,
         }
     }
 }
@@ -79,7 +81,7 @@ pub trait Processor: Send {
 pub struct StreamInfo {
     pub backend: Backend,
     pub share_mode: ShareMode,
-    pub capture_format: StreamFormat,
+    pub capture_format: Option<StreamFormat>,
     pub render_format: StreamFormat,
     pub channels: u16,
     pub period_frames: u32,

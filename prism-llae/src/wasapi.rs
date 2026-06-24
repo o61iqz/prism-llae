@@ -399,7 +399,15 @@ fn render_loop(mut ctx: RenderCtx, stop: Arc<AtomicBool>) {
 pub fn start(config: &EngineConfig, processor: Box<dyn Processor>) -> Result<Stream> {
     let en = enumerator()?;
     let render_dev = pick_device(&en, eRender, config.render_device.as_deref())?;
-    let capture_dev = pick_device(&en, eCapture, config.capture_device.as_deref())?;
+    let capture_dev = if config.output_only {
+        None
+    } else {
+        match pick_device(&en, eCapture, config.capture_device.as_deref()) {
+            Ok(dev) => Some(dev),
+            Err(_) if config.capture_device.is_none() => None,
+            Err(e) => return Err(e),
+        }
+    };
 
     let render = match config.share_mode {
         ShareMode::Shared => setup_shared(&render_dev, config.buffer_frames)?,
@@ -408,39 +416,46 @@ pub fn start(config: &EngineConfig, processor: Box<dyn Processor>) -> Result<Str
             setup_exclusive(&render_dev, config, rate, ch)?
         }
     };
-    let capture = match config.share_mode {
-        ShareMode::Shared => setup_shared(&capture_dev, config.buffer_frames)?,
-        ShareMode::Exclusive => {
-            let (rate, ch) = mix_rate_channels(&capture_dev)?;
-            setup_exclusive(&capture_dev, config, rate, ch)?
-        }
+    let capture = match &capture_dev {
+        Some(dev) => Some(match config.share_mode {
+            ShareMode::Shared => setup_shared(dev, config.buffer_frames)?,
+            ShareMode::Exclusive => {
+                let (rate, ch) = mix_rate_channels(dev)?;
+                setup_exclusive(dev, config, rate, ch)?
+            }
+        }),
+        None => None,
     };
 
-    if capture.format.sample_rate != render.format.sample_rate {
-        eprintln!(
-            "[prism-llae] warning: capture {} Hz != render {} Hz; duplex will drift",
-            capture.format.sample_rate, render.format.sample_rate
-        );
+    if let Some(cap) = &capture {
+        if cap.format.sample_rate != render.format.sample_rate {
+            eprintln!(
+                "[prism-llae] warning: capture {} Hz != render {} Hz; duplex will drift",
+                cap.format.sample_rate, render.format.sample_rate
+            );
+        }
     }
 
     let proc_ch = render.format.channels as usize;
+    let cap_fmt = capture.as_ref().map(|c| c.format).unwrap_or(render.format);
+    let cap_buffer_frames = capture.as_ref().map(|c| c.buffer_frames).unwrap_or(0);
     let info = StreamInfo {
         backend: crate::Backend::Wasapi,
         share_mode: config.share_mode,
-        capture_format: capture.format,
+        capture_format: capture.as_ref().map(|c| c.format),
         render_format: render.format,
         channels: render.format.channels,
         period_frames: render.buffer_frames,
-        capture_period_frames: capture.buffer_frames,
+        capture_period_frames: cap_buffer_frames,
     };
 
     let stats = Arc::new(StreamStats::default());
     // a few periods of ring slack absorb capture/render jitter
     let ring_frames =
-        (render.buffer_frames.max(capture.buffer_frames) as usize * 4).next_power_of_two();
+        (render.buffer_frames.max(cap_buffer_frames) as usize * 4).next_power_of_two();
     let prime_frames = render.buffer_frames as usize;
     let (sink, source) = make_duplex(
-        capture.format,
+        cap_fmt,
         render.format,
         proc_ch,
         ring_frames,
@@ -449,15 +464,6 @@ pub fn start(config: &EngineConfig, processor: Box<dyn Processor>) -> Result<Str
         stats.clone(),
     );
 
-    let capture_ctx = CaptureCtx {
-        capture: unsafe { capture.client.GetService::<IAudioCaptureClient>()? },
-        frame_bytes: capture.format.frame_bytes(),
-        silent: vec![0u8; capture.buffer_frames as usize * capture.format.frame_bytes()],
-        client: capture.client,
-        event: capture.event,
-        sink,
-        first_packet: true,
-    };
     let render_ctx = RenderCtx {
         render: unsafe { render.client.GetService::<IAudioRenderClient>()? },
         frame_bytes: render.format.frame_bytes(),
@@ -470,18 +476,34 @@ pub fn start(config: &EngineConfig, processor: Box<dyn Processor>) -> Result<Str
     };
 
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_c = stop.clone();
     let stop_r = stop.clone();
-    let t_cap = std::thread::Builder::new()
-        .name("audio-capture".into())
-        .spawn(move || capture_loop(capture_ctx, stop_c))
-        .map_err(|e| EngineError::Backend(format!("spawn capture: {e}")))?;
     let t_ren = std::thread::Builder::new()
         .name("audio-render".into())
         .spawn(move || render_loop(render_ctx, stop_r))
         .map_err(|e| EngineError::Backend(format!("spawn render: {e}")))?;
+    let mut threads = vec![t_ren];
 
-    Ok(Stream::new(stop, vec![t_cap, t_ren], stats, info))
+    if let Some(cap) = capture {
+        let capture_ctx = CaptureCtx {
+            capture: unsafe { cap.client.GetService::<IAudioCaptureClient>()? },
+            frame_bytes: cap.format.frame_bytes(),
+            silent: vec![0u8; cap.buffer_frames as usize * cap.format.frame_bytes()],
+            client: cap.client,
+            event: cap.event,
+            sink,
+            first_packet: true,
+        };
+        let stop_c = stop.clone();
+        let t_cap = std::thread::Builder::new()
+            .name("audio-capture".into())
+            .spawn(move || capture_loop(capture_ctx, stop_c))
+            .map_err(|e| EngineError::Backend(format!("spawn capture: {e}")))?;
+        threads.push(t_cap);
+    } else {
+        drop(sink);
+    }
+
+    Ok(Stream::new(stop, threads, stats, info))
 }
 
 // current shared-mode mix rate of an endpoint (the device's configured rate)

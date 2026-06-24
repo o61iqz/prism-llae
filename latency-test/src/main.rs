@@ -176,6 +176,7 @@ impl Opts {
             input_channel: self.in_ch,
             output_channel: self.out_ch,
             force_format: None,
+            output_only: false,
         }
     }
 
@@ -262,7 +263,9 @@ fn print_stream_banner(info: &StreamInfo) {
     println!(
         "engine: {} ({mode})\n  capture: {}\n  render : {}\n  period : {} frames (render), {} frames (capture)\n  engine buffering: ~{:.2} ms one-way",
         backend_name(info.backend),
-        info.capture_format.describe(),
+        info.capture_format
+            .map(|f| f.describe())
+            .unwrap_or_else(|| "none (render-only)".into()),
         info.render_format.describe(),
         info.period_frames,
         info.capture_period_frames,

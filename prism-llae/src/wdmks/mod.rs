@@ -761,41 +761,63 @@ pub fn start(config: &EngineConfig, processor: Box<dyn Processor>) -> Result<Str
         config.render_device.as_deref(),
         config.force_format,
     )?;
-    let capture = find_pin(
-        false,
-        want_rate,
-        want_ch,
-        config.capture_device.as_deref(),
-        config.force_format,
-    )?;
+    let capture = if config.output_only {
+        None
+    } else {
+        match find_pin(
+            false,
+            want_rate,
+            want_ch,
+            config.capture_device.as_deref(),
+            config.force_format,
+        ) {
+            Ok(p) => Some(p),
+            Err(_) if config.capture_device.is_none() => None,
+            Err(e) => return Err(e),
+        }
+    };
 
     let render_pin = create_pin(render.filter, render.pin.pin_id, render.pin.format, true)?;
-    let capture_pin = create_pin(capture.filter, capture.pin.pin_id, capture.pin.format, false)?;
 
     let proc_ch = render.pin.format.channels as usize;
+    let cap_fmt = capture
+        .as_ref()
+        .map(|c| c.pin.format)
+        .unwrap_or(render.pin.format);
     let info = StreamInfo {
         backend: crate::Backend::WdmKs,
         share_mode: ShareMode::Exclusive,
-        capture_format: capture.pin.format,
+        capture_format: capture.as_ref().map(|c| c.pin.format),
         render_format: render.pin.format,
         channels: render.pin.format.channels,
         period_frames: period_frames as u32,
-        capture_period_frames: period_frames as u32,
+        capture_period_frames: if capture.is_some() {
+            period_frames as u32
+        } else {
+            0
+        },
     };
-    eprintln!(
-        "[prism-llae] ks render pin: {} ({}), capture pin: {} ({})",
-        render.name,
-        render.pin.format.describe(),
-        capture.name,
-        capture.pin.format.describe()
-    );
+    match &capture {
+        Some(c) => eprintln!(
+            "[prism-llae] ks render pin: {} ({}), capture pin: {} ({})",
+            render.name,
+            render.pin.format.describe(),
+            c.name,
+            c.pin.format.describe()
+        ),
+        None => eprintln!(
+            "[prism-llae] ks render pin: {} ({}), capture: none (render-only)",
+            render.name,
+            render.pin.format.describe()
+        ),
+    }
 
     let stats = Arc::new(StreamStats::default());
     let ring_frames = (period_frames * N_BUFFERS * 4).next_power_of_two();
     // cushion so render pulls don't race ahead of capture pushes
     let prime_frames = period_frames * 2;
     let (sink, source) = make_duplex(
-        capture.pin.format,
+        cap_fmt,
         render.pin.format,
         proc_ch,
         ring_frames,
@@ -805,21 +827,28 @@ pub fn start(config: &EngineConfig, processor: Box<dyn Processor>) -> Result<Str
     );
 
     let render_stream = make_pin_stream(render.filter, render_pin, render.pin.format, period_frames)?;
-    let capture_stream =
-        make_pin_stream(capture.filter, capture_pin, capture.pin.format, period_frames)?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_r = stop.clone();
-    let stop_c = stop.clone();
     let info_r = info.clone();
     let t_ren = std::thread::Builder::new()
         .name("ks-render".into())
         .spawn(move || render_loop(render_stream, source, info_r, stop_r))
         .map_err(|e| EngineError::Backend(format!("spawn ks render: {e}")))?;
-    let t_cap = std::thread::Builder::new()
-        .name("ks-capture".into())
-        .spawn(move || capture_loop(capture_stream, sink, stop_c))
-        .map_err(|e| EngineError::Backend(format!("spawn ks capture: {e}")))?;
+    let mut threads = vec![t_ren];
 
-    Ok(Stream::new(stop, vec![t_ren, t_cap], stats, info))
+    if let Some(c) = capture {
+        let capture_pin = create_pin(c.filter, c.pin.pin_id, c.pin.format, false)?;
+        let capture_stream = make_pin_stream(c.filter, capture_pin, c.pin.format, period_frames)?;
+        let stop_c = stop.clone();
+        let t_cap = std::thread::Builder::new()
+            .name("ks-capture".into())
+            .spawn(move || capture_loop(capture_stream, sink, stop_c))
+            .map_err(|e| EngineError::Backend(format!("spawn ks capture: {e}")))?;
+        threads.push(t_cap);
+    } else {
+        drop(sink);
+    }
+
+    Ok(Stream::new(stop, threads, stats, info))
 }

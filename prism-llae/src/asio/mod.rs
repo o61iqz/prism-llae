@@ -245,6 +245,7 @@ struct AsioRuntime {
     out_f32: Vec<f32>,
     proc: Box<dyn Processor>,
     output_ready: bool,
+    output_only: bool,
     stats: Arc<StreamStats>,
 }
 
@@ -256,10 +257,16 @@ impl AsioRuntime {
         let n = self.buffer_size;
         let ch = self.channels;
 
-        for c in 0..ch {
-            let base = self.in_ptrs[c][index] as *const u8;
-            for f in 0..n {
-                self.in_f32[f * ch + c] = unsafe { read_sample(base, self.sample_type, f) };
+        if self.output_only {
+            for s in self.in_f32[..n * ch].iter_mut() {
+                *s = 0.0;
+            }
+        } else {
+            for c in 0..ch {
+                let base = self.in_ptrs[c][index] as *const u8;
+                for f in 0..n {
+                    self.in_f32[f * ch + c] = unsafe { read_sample(base, self.sample_type, f) };
+                }
             }
         }
 
@@ -499,11 +506,15 @@ fn run_control(
             let info = StreamInfo {
                 backend: Backend::Asio,
                 share_mode: ShareMode::Exclusive,
-                capture_format: fmt,
+                capture_format: if config.output_only { None } else { Some(fmt) },
                 render_format: fmt,
                 channels: channels as u16,
                 period_frames: buffer_size as u32,
-                capture_period_frames: buffer_size as u32,
+                capture_period_frames: if config.output_only {
+                    0
+                } else {
+                    buffer_size as u32
+                },
             };
             eprintln!(
                 "[prism-llae] ASIO: {} in / {} out ch, buffer {} frames, driver latency in:{} out:{}",
@@ -521,6 +532,7 @@ fn run_control(
                 out_f32: vec![0.0; buffer_size * channels],
                 proc: std::mem::replace(&mut processor, Box::new(NullProc)),
                 output_ready,
+                output_only: config.output_only,
                 stats: stats.clone(),
             });
             runtime.proc.on_start(&info);
