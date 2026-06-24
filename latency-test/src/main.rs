@@ -518,8 +518,8 @@ fn run_latency(config: &EngineConfig, trials: usize) -> Result<LatencyOutcome> {
     stream.stop();
 
     let hits = shared.results_frames.lock().unwrap().clone();
-    let delivery = if stats.render_frames > 0 {
-        stats.capture_frames as f64 / stats.render_frames as f64
+    let delivery = if stats.render_calls > 0 {
+        stats.render_calls.saturating_sub(stats.underruns) as f64 / stats.render_calls as f64
     } else {
         0.0
     };
