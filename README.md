@@ -46,6 +46,7 @@ Devices are never guessed: every streaming command needs `--in`/`--out` (or
 latency_test list --backend wasapi
 
 # Example: live monitoring (USE HEADPHONES to avoid feedback)
+# prints a live meter plus running cb/under/over/glitch counters
 latency_test monitor --backend wasapi --in "Mic" --out "Speakers"
 
 # Example: roundtrip latency (needs a loopback path)
@@ -92,8 +93,9 @@ latency_test sweep --asio MiniFuse --out "Virtual 7/8" --in "Loopback Main 7/8" 
 | WDM/KS           | 48k i24, 32f     | 4.81 ms    |
 | ASIO             | 48k i32, 8f      | 1.65 ms    |
 
-Figures are deterministic to the sample; all run glitch free (0 underruns, 100%
-delivery). Each backend exposes only a subset of supported rates/formats.
+Figures are deterministic to the sample; all run glitch free (0 underruns, 0
+glitches, 100% delivery). Each backend exposes only a subset of supported
+rates/formats.
 
 ## Notes
 
@@ -103,8 +105,22 @@ delivery). Each backend exposes only a subset of supported rates/formats.
 - ASIO drivers are read from `HKLM\SOFTWARE\ASIO`; one driver is the whole
   full-duplex device. `--out-ch`/`--in-ch` pick channels (`AUDIO_DEBUG=1` prints
   the channel map). Only one ASIO stream may be active at a time.
-- `latency` prints `N% delivered`; well under 100% means the input pin isn't
-  sustaining full rate.
+- **Stream health** is exposed via `Stream::stats()` and printed by `monitor`
+  and `latency`: `underruns` (render starved the ring), `overruns` (capture
+  outran it), and `glitches` (a capture discontinuity — flagged from the WASAPI
+  discontinuity flag, or inferred from packet timestamps / a wall-clock drift
+  check on KS, which has no native flag). These are ring-based counters; ASIO
+  runs the `Processor` straight in `bufferSwitch` with no ring, so it reports 0.
+- `latency` prints `N% delivered`: the fraction of render periods that pulled a
+  full buffer of real audio, computed exactly as `(render_calls − underruns) /
+  render_calls`. Anything under 100% means the input side isn't sustaining full
+  rate. (Render-only streams report 0%, since nothing is captured.)
+- **Output-only mode.** Capture is optional: set `EngineConfig.output_only` (or just
+  let a missing default capture device fall back gracefully) to open a render-only
+  stream. No capture endpoint is created, the `Processor` receives silence as its
+  input, and `StreamInfo.capture_format` is `None` (with `capture_period_frames` 0).
+  This lets players, synths, machines without a microphone, or any playback-only
+  applications open a stream. A *named* capture device that fails to open is still an error.
 
 ## License
 
