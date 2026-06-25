@@ -695,41 +695,74 @@ fn capture_loop(s: PinStream, sink: CaptureSink, stop: Arc<AtomicBool>) {
     }
 }
 
+// USB-audio paths encode the channel group as `_sdN_` (sd1 = 1/2, sd2 = 3/4, ...)
+fn channel_pair(path: &str) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    let at = lower.find("_sd")?;
+    let digits: String = lower[at + 3..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let n: u32 = digits.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(format!("{}/{}", 2 * n - 1, 2 * n))
+}
+
+// "(out 1/2)" with a known pair, else "(out 2)" to number same-direction pins, else "(out)"
+fn endpoint_name(base: &str, dir: &str, pair: Option<&str>, count: u32, index: u32) -> String {
+    if let Some(p) = pair {
+        format!("{base} ({dir} {p})")
+    } else if count <= 1 {
+        format!("{base} ({dir})")
+    } else {
+        format!("{base} ({dir} {})", index + 1)
+    }
+}
+
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     let mut out = Vec::new();
     for filter in enumerate_filters()? {
+        let id = String::from_utf16_lossy(&filter.path_w);
+        // MIDI pins show up under KSCATEGORY_AUDIO but aren't PCM endpoints
+        if id.to_ascii_lowercase().contains("midi") {
+            continue;
+        }
         let h = match open_filter(&filter.path_w) {
             Ok(h) => h,
             Err(_) => continue,
         };
         let n = pin_count(h).unwrap_or(0);
-        let mut has_render = false;
-        let mut has_capture = false;
+        // streaming pins per direction, to disambiguate a multi-I/O device
+        let mut out_pins = 0u32; // render (DATAFLOW_IN)
+        let mut in_pins = 0u32; // capture (DATAFLOW_OUT)
         for pin in 0..n {
             let comm = pin_u32(h, pin, KSPROPERTY_PIN_COMMUNICATION.0).unwrap_or(0) as i32;
             if comm != KSPIN_COMMUNICATION_SINK.0 && comm != KSPIN_COMMUNICATION_BOTH.0 {
                 continue;
             }
             match pin_u32(h, pin, KSPROPERTY_PIN_DATAFLOW.0).unwrap_or(0) as i32 {
-                x if x == KSPIN_DATAFLOW_IN.0 => has_render = true,
-                x if x == KSPIN_DATAFLOW_OUT.0 => has_capture = true,
+                x if x == KSPIN_DATAFLOW_IN.0 => out_pins += 1,
+                x if x == KSPIN_DATAFLOW_OUT.0 => in_pins += 1,
                 _ => {}
             }
         }
         unsafe {
             let _ = CloseHandle(h);
         }
-        if has_render {
+        let pair = channel_pair(&id);
+        for i in 0..out_pins {
             out.push(DeviceInfo {
-                id: String::from_utf16_lossy(&filter.path_w),
-                name: format!("{} (render)", filter.name),
+                id: id.clone(),
+                name: endpoint_name(&filter.name, "out", pair.as_deref(), out_pins, i),
                 is_capture: false,
             });
         }
-        if has_capture {
+        for i in 0..in_pins {
             out.push(DeviceInfo {
-                id: String::from_utf16_lossy(&filter.path_w),
-                name: format!("{} (capture)", filter.name),
+                id: id.clone(),
+                name: endpoint_name(&filter.name, "in", pair.as_deref(), in_pins, i),
                 is_capture: true,
             });
         }

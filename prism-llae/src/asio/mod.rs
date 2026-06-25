@@ -100,15 +100,15 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     let mut out = Vec::new();
     for (name, clsid) in enumerate_drivers() {
         let id = format!("{clsid:?}");
-        // one full-duplex device; surface on both sides for --in / --out
+        // one full-duplex device, surfaced on both sides for --in / --out
         out.push(DeviceInfo {
             id: id.clone(),
-            name: format!("{name} (render)"),
+            name: name.clone(),
             is_capture: false,
         });
         out.push(DeviceInfo {
             id,
-            name: format!("{name} (capture)"),
+            name,
             is_capture: true,
         });
     }
